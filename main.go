@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/gob"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/cornelk/hashmap"
 	"github.com/semihalev/log"
 )
 
@@ -18,38 +21,32 @@ var (
 	host, port, dbFileName string
 	bgSaveInterval         time.Duration
 	appLog                 log.Logger
-	commands               map[string]func(*store, net.Conn, []string)
-	memStore               *store
+	commands               map[string]func(*hashmap.HashMap, []string) []string
+	store                  *hashmap.HashMap
 )
 
 const (
-	errParamNotEnough       = "Param not enough (required %d)"
-	infoDbLoadings          = "DB Loading"
-	infoDBFileDoesNotExists = "DB file does not exists, creating (%s)"
-	infoDBFileOpening       = "DB file opening (%s)"
-	infoTCPListening        = "TCP Listening (%s)"
-	infoClientConnected     = "Client connected (%s)"
+	errEmptyMsg         = "You need to use one of these: %s"
+	errParamNotEnough   = "Param not enough (required %d)"
+	infoDbLoadings      = "DB Loading"
+	infoDBFileOpening   = "DB file opening (%s)"
+	infoTCPListening    = "TCP Listening (%s)"
+	infoClientConnected = "Client connected (%s)"
 
 	//default response
-	responseNull    = "NULL\n"
-	responseOK      = "OK\n"
-	responseUnknown = "UNKNOWN\n"
+	responseNull = "NULL\n"
+	responseOK   = "OK\n"
 )
 
 const (
 	ver = 1.0
 )
 
-type store struct {
-	sync.RWMutex
-	l map[string]string
-}
-
 func init() {
 	flag.StringVar(&host, "host", "127.0.0.1", "Host")
 	flag.StringVar(&port, "port", "1234", "Port")
 	flag.StringVar(&dbFileName, "file", "store.db", "Store DB filename")
-	flag.DurationVar(&bgSaveInterval, "bgSaveInterval", 5, "Background save interval")
+	flag.DurationVar(&bgSaveInterval, "bgSaveInterval", 1, "Background save interval")
 }
 
 func main() {
@@ -58,37 +55,29 @@ func main() {
 	appLog = log.New("host", host, "port", port, "dbfile", dbFileName, "ver", ver)
 	appLog.Info("oOoOo miniredis oOoO")
 
-	memStore = &store{}
-	memStore.l = make(map[string]string)
+	store = &hashmap.HashMap{}
 
-	commands = map[string]func(*store, net.Conn, []string){
-		"GET":  get,
-		"SET":  set,
-		"DEL":  del,
-		"KEYS": keys,
-	}
-
-	if !fileExists(dbFileName) {
-		appLog.Info(fmt.Sprintf(infoDBFileDoesNotExists, dbFileName))
-
-		_, err := os.Create(dbFileName)
-
-		if err != nil {
-			appLog.Error(err.Error())
-			os.Exit(1)
-		}
+	commands = map[string]func(*hashmap.HashMap, []string) []string{
+		"GET":    get,
+		"MGET":   mget,
+		"SET":    set,
+		"MSET":   mset,
+		"DEL":    del,
+		"DBSIZE": dbSize,
+		"KEYS":   keys,
 	}
 
 	appLog.Info(fmt.Sprintf(infoDBFileOpening, dbFileName))
-	dbFile, err := os.OpenFile(dbFileName, os.O_RDWR, 0644)
+	dbFile, err := os.OpenFile(dbFileName, os.O_RDWR|os.O_CREATE, 0644)
 
 	if err != nil {
 		appLog.Error(err.Error())
 		os.Exit(1)
 	}
 
-	loadDB(memStore, dbFile)
-	go bgSave(memStore, gob.NewEncoder(dbFile))
+	loadDB(store, dbFile)
+
+	go bgSave(store, dbFile)
 
 	hostURI := fmt.Sprintf("%s:%s", host, port)
 	tcpServ, err := net.Listen("tcp", hostURI)
@@ -118,104 +107,171 @@ func main() {
 func listen(c net.Conn) {
 	appLog.Info(fmt.Sprintf(infoClientConnected, c.RemoteAddr()))
 	for {
-		msg, _ := bufio.NewReader(c).ReadString('\n')
-		params := strings.Fields(msg)
+		msg, err := bufio.NewReader(c).ReadString('\n')
 
-		if len(params) < 1 {
-			appLog.Error(errParamNotEnough)
+		if err != nil {
+			continue
 		}
+
+		if len(msg) < 3 {
+			keys := reflect.ValueOf(commands).MapKeys()
+			errMsg := fmt.Sprintf(errEmptyMsg, keys)
+			c.Write([]byte(errMsg + "\n"))
+			appLog.Info(errMsg)
+			continue
+		}
+
+		params := strings.Fields(msg)
 
 		cmd, exists := commands[strings.ToUpper(params[0])]
 
 		if !exists {
-			c.Write([]byte(responseUnknown))
+			keys := reflect.ValueOf(commands).MapKeys()
+			errMsg := fmt.Sprintf(errEmptyMsg, keys)
+			c.Write([]byte(errMsg + "\n"))
+			appLog.Info(errMsg)
 			continue
 		}
 
-		cmd(memStore, c, params)
+		rsp := cmd(store, params)
+
+		for _, r := range rsp {
+			c.Write([]byte(r + "\n"))
+		}
+
 	}
 }
 
 //cmds
-func get(s *store, c net.Conn, p []string) {
+func get(s *hashmap.HashMap, p []string) (rsp []string) {
 	if len(p) < 2 {
 		appLog.Error(fmt.Sprintf(errParamNotEnough, 1))
-		return
+		return rsp
 	}
 
-	s.RLock()
-	val, ok := s.l[p[1]]
+	val, ok := s.Get(p[1])
 
 	if !ok {
-		c.Write([]byte(responseNull))
-		return
+		rsp = append(rsp, responseNull)
+		return rsp
 	}
-	c.Write([]byte(val + "\n"))
-	s.RUnlock()
 
+	rsp = append(rsp, val.(string))
+
+	return rsp
 }
 
-func del(s *store, c net.Conn, p []string) {
+func mget(s *hashmap.HashMap, p []string) (rsp []string) {
 	if len(p) < 2 {
 		appLog.Error(fmt.Sprintf(errParamNotEnough, 1))
-		return
+		return rsp
 	}
 
-	s.RLock()
-	_, exists := s.l[p[1]]
-	if exists {
-		delete(s.l, p[1])
-	}
-	s.RUnlock()
+	for i := 1; i < len(p); i++ {
 
-	c.Write([]byte(responseOK))
+		val, ok := s.Get(p[i])
+		if !ok {
+			rsp = append(rsp, responseNull)
+			return rsp
+		}
+
+		rsp = append(rsp, val.(string))
+
+	}
+
+	return rsp
 }
 
-func set(s *store, c net.Conn, p []string) {
+func del(s *hashmap.HashMap, p []string) (rsp []string) {
+	if len(p) < 2 {
+		appLog.Error(fmt.Sprintf(errParamNotEnough, 1))
+		return rsp
+	}
+
+	_, exists := s.Get(p[1])
+
+	if exists {
+		s.Del(p[1])
+	}
+
+	rsp = append(rsp, responseOK)
+	return rsp
+}
+
+func set(s *hashmap.HashMap, p []string) (rsp []string) {
 	if len(p) < 3 {
 		appLog.Error(fmt.Sprintf(errParamNotEnough, 2))
-		return
+		return rsp
 	}
 
-	s.RLock()
-	s.l[p[1]] = p[2]
-	s.RUnlock()
+	s.Set(p[1], p[2])
 
-	c.Write([]byte(responseOK))
+	rsp = append(rsp, responseOK)
+	return rsp
 }
 
-func keys(s *store, c net.Conn, p []string) {
-	s.RLock()
-	for key, _ := range s.l {
-		c.Write([]byte(key + "\n"))
+func mset(s *hashmap.HashMap, p []string) (rsp []string) {
+	if len(p) < 3 || (len(p)-1)%2 == 1 {
+		appLog.Error(fmt.Sprintf(errParamNotEnough, 2))
+		return rsp
 	}
-	s.RUnlock()
+
+	for i := 1; i < len(p); i += 2 {
+		s.Set(p[i], p[i+1])
+	}
+
+	rsp = append(rsp, responseOK)
+	return rsp
+}
+
+func dbSize(s *hashmap.HashMap, p []string) (rsp []string) {
+	length := strconv.Itoa(s.Len())
+	rsp = append(rsp, length)
+	return rsp
+}
+
+func keys(s *hashmap.HashMap, p []string) (rsp []string) {
+
+	for item := range s.Iter() {
+		rsp = append(rsp, item.Key.(string))
+	}
+	return rsp
 }
 
 //bgSave background save function
-func bgSave(s *store, enc *gob.Encoder) {
+func bgSave(s *hashmap.HashMap, f *os.File) {
 	for {
 		time.Sleep(bgSaveInterval * time.Second)
 
-		if err := enc.Encode(s.l); err != nil {
-			panic(err)
+		var (
+			buf bytes.Buffer
+			tmp = make(map[string]string)
+		)
+
+		for item := range s.Iter() {
+			tmp[item.Key.(string)] = item.Value.(string)
 		}
 
+		enc := gob.NewEncoder(&buf)
+
+		if err := enc.Encode(tmp); err != nil {
+			appLog.Error(err.Error())
+		}
+
+		f.WriteAt(buf.Bytes(), 0)
 	}
 }
 
-func loadDB(s *store, dbFile *os.File) {
+func loadDB(s *hashmap.HashMap, f *os.File) {
 	appLog.Info(infoDbLoadings)
 
-	decoder := gob.NewDecoder(dbFile)
-	decoder.Decode(&s.l)
-}
+	var tmp = make(map[string]string)
 
-//util
-func fileExists(filename string) bool {
-	info, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		return false
+	decoder := gob.NewDecoder(f)
+	decoder.Decode(&tmp)
+
+	for key, value := range tmp {
+		s.Set(key, value)
 	}
-	return !info.IsDir()
+
 }
